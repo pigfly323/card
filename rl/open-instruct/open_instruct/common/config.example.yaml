@@ -1,0 +1,131 @@
+# MCP-Factory / Open-Instruct example configuration
+#
+# This file is a sanitized example of `config.yaml` with all secrets removed.
+# Replace placeholders with your own values or inject them via environment variables.
+
+global:
+  project_root: .
+  data_root: Data
+
+
+# -----------------------------------------------------------------------------
+# API key pool
+# -----------------------------------------------------------------------------
+#
+# Notes:
+# - `api_key_list` is matched to backends by `base_url`.
+# - `api_key` values can be literal strings or environment placeholders like
+#   `${OPENAI_API_KEY_1}`.
+# - You can mark a key as `bypass: true` for content-safety bypass pools if your
+#   internal gateway supports that workflow.
+
+api_key_list:
+  - key_id: pool_key_01
+    api_key: ${OPENAI_API_KEY_1}
+    base_url: ${OPENAI_API_BASE}
+    description: "Primary pool key 01"
+
+  - key_id: pool_key_02
+    api_key: ${OPENAI_API_KEY_2}
+    base_url: ${OPENAI_API_BASE}
+    description: "Primary pool key 02"
+
+  - key_id: bypass_key_01
+    api_key: ${OPENAI_BYPASS_API_KEY_1}
+    base_url: ${OPENAI_API_BASE}
+    description: "Optional bypass key 01"
+    bypass: true
+
+
+# -----------------------------------------------------------------------------
+# LLM backends
+# -----------------------------------------------------------------------------
+
+llm_backends:
+  deepseek_main:
+    base_url: ${OPENAI_API_BASE}
+    model: ${MAIN_MODEL:-deepseek-v4-pro-tencent}
+    temperature: 0.7
+    max_context_tokens: 32000
+    max_response_tokens: 8192
+    timeout_seconds: 30
+    rpm: 50
+
+  gpt5_1_main:
+    base_url: ${OPENAI_API_BASE}
+    model: ${LONG_CONTEXT_MODEL:-gemini-2.5-pro}
+    temperature: 0.7
+    max_context_tokens: 1000000
+    max_response_tokens: 65530
+    timeout_seconds: 180
+    rpm: 20
+
+  deepseek_reasoner:
+    base_url: ${OPENAI_API_BASE}
+    model: ${REASONER_MODEL:-deepseek-reasoner}
+    temperature: 0.2
+    max_context_tokens: 32000
+    max_response_tokens: 32000
+    timeout_seconds: 180
+    rpm: 50
+
+  # ---------------------------------------------------------------------------
+  # Reward / verify_answer judges
+  # ---------------------------------------------------------------------------
+  # `rubric_judge`:
+  #   - used by training-time rubric reward computation
+  #   - also reused by verify_answer / verify_longform_answer feedback
+  #
+  # `citation_judge`:
+  #   - used by training-time citation reward computation
+  #   - also reused by verify_answer citation feedback
+  #
+  # `rubric_generation`:
+  #   - used when adaptive rubrics are enabled
+  #
+  # In many experiments, these are overridden again by shell env vars such as:
+  #   RUBRIC_JUDGE_MODEL
+  #   CITATION_JUDGE_MODEL
+  #   RUBRIC_JUDGE_API_BASE
+  #   CITATION_JUDGE_API_BASE
+  # but keeping config defaults here is still useful.
+
+  rubric_judge:
+    base_url: ${RUBRIC_JUDGE_API_BASE:-${OPENAI_API_BASE}}
+    model: ${RUBRIC_JUDGE_MODEL:-deepseek-v3.2-huawei}
+    temperature: 0.0
+    max_context_tokens: 32000
+    max_response_tokens: 2048
+    timeout_seconds: 300
+    rpm: 50
+
+  rubric_generation:
+    base_url: ${RUBRIC_GENERATION_API_BASE:-${RUBRIC_JUDGE_API_BASE:-${OPENAI_API_BASE}}}
+    model: ${RUBRIC_GENERATION_MODEL:-${RUBRIC_JUDGE_MODEL:-deepseek-v3.2-huawei}}
+    temperature: 0.7
+    max_context_tokens: 32000
+    max_response_tokens: 2048
+    timeout_seconds: 120
+    rpm: 20
+
+  citation_judge:
+    base_url: ${CITATION_JUDGE_API_BASE:-${RUBRIC_JUDGE_API_BASE:-${OPENAI_API_BASE}}}
+    model: ${CITATION_JUDGE_MODEL:-deepseek-v3.2-huawei}
+    temperature: 0.0
+    max_context_tokens: 32000
+    max_response_tokens: 4096
+    timeout_seconds: 120
+    rpm: 50
+    # enable_thinking: true
+
+
+# -----------------------------------------------------------------------------
+# Execution defaults
+# -----------------------------------------------------------------------------
+
+execution:
+  max_concurrent: 200
+  max_retries: 20
+  retry_delay: 10.0
+  json_parse_retries: 3
+
