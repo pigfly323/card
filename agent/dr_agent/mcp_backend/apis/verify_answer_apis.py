@@ -57,8 +57,6 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-import aiohttp
-
 from .rubric_store import RubricStore, normalize_rubric_payload
 
 logger = logging.getLogger(__name__)
@@ -380,6 +378,10 @@ async def generate_adaptive_rubrics(
 
     pool = _get_rubric_judge_pool()
     try:
+        agent = _get_rubric_generation_agent()
+        if agent is None:
+            logger.warning("[verify_answer] rubric generation agent unavailable")
+            return None
         raw = await _call_judge_api_with_retry(
             system_prompt="",
             user_prompt=user_prompt,
@@ -388,8 +390,9 @@ async def generate_adaptive_rubrics(
             max_tokens=max_tokens,
             timeout_s=timeout_s,
             pool=pool,
+            agent=agent,
         )
-        obj = _extract_json_from_response(raw)
+        obj = raw if isinstance(raw, dict) else _extract_json_from_response(raw)
         if not isinstance(obj, dict):
             logger.warning("[verify_answer] adaptive rubric generation returned non-dict: %s", type(obj))
             return None
@@ -516,6 +519,27 @@ def _get_rubric_judge_agent():
     return _RUBRIC_JUDGE_AGENT
 
 
+# Rubric generation Agent (lazy-initialized, backed by config.yaml rubric_generation backend)
+_RUBRIC_GENERATION_AGENT = None
+_RUBRIC_GENERATION_AGENT_LOCK = threading.Lock()
+
+
+def _get_rubric_generation_agent():
+    global _RUBRIC_GENERATION_AGENT
+    if _RUBRIC_GENERATION_AGENT is not None:
+        return _RUBRIC_GENERATION_AGENT
+    with _RUBRIC_GENERATION_AGENT_LOCK:
+        if _RUBRIC_GENERATION_AGENT is not None:
+            return _RUBRIC_GENERATION_AGENT
+        try:
+            _RUBRIC_GENERATION_AGENT = _make_judge_agent("rubric_generation", "rubric_generation")
+            logger.info("[verify_answer] rubric generation agent initialized from config.yaml")
+        except Exception as e:
+            logger.warning("[verify_answer] failed to init rubric generation agent: %s", e)
+            _RUBRIC_GENERATION_AGENT = None
+    return _RUBRIC_GENERATION_AGENT
+
+
 # Citation judge Agent (lazy-initialized, backed by config.yaml citation_judge backend)
 _CITATION_JUDGE_AGENT = None
 _CITATION_JUDGE_AGENT_LOCK = threading.Lock()
@@ -549,79 +573,57 @@ async def _call_judge_api_with_retry(
     max_tokens: int,
     timeout_s: float,
     pool,
-) -> str:
+    agent=None,
+) -> Any:
     """
-    Call an OpenAI-compatible chat completions endpoint with:
-    - Round-robin API key rotation from pool
-    - 429 rate-limit handling: mark key as cooled, retry with next key
-    - Timeout handling: exponential backoff retry
-    - All exceptions are propagated to caller after max_retries exhausted
-    """
-    max_retries = int(os.environ.get("RUBRIC_JUDGE_MAX_RETRIES", "3"))
-    retry_after = float(os.environ.get("RUBRIC_JUDGE_RETRY_AFTER", "60"))
-    url = f"{api_base.rstrip('/')}/chat/completions"
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.0,
-        "max_tokens": max_tokens,
-    }
+    Call a judge Agent (backed by config.yaml) and return parsed JSON.
 
+    The legacy model/api_base/pool parameters are kept for call-site compatibility,
+    but actual transport is delegated to the Agent/LLMClient stack instead of a
+    direct aiohttp OpenAI-compatible API call.
+
+    Returns a parsed JSON object/dict when successful.
+    """
+    # Legacy args kept only for compatibility with existing call sites.
+    _ = (model, api_base, pool)
+
+    max_retries = int(os.environ.get("RUBRIC_JUDGE_MAX_RETRIES", "3"))
     last_exc: Optional[Exception] = None
+    judge_agent = agent or _get_rubric_judge_agent()
+    if judge_agent is None:
+        raise RuntimeError("Judge agent unavailable")
+
     for attempt in range(max_retries):
-        api_key = pool.get()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
-        client_timeout = aiohttp.ClientTimeout(total=timeout_s)
         try:
-            async with aiohttp.ClientSession(timeout=client_timeout) as session:
-                async with session.post(url, headers=headers, json=payload) as resp:
-                    text = await resp.text()
-                    if resp.status == 429:
-                        pool.mark_rate_limited(api_key)
-                        last_exc = RuntimeError(f"429 rate limited (key={api_key[:8]}...)")
-                        wait = min(retry_after, 5 * (2 ** attempt))
-                        logger.warning(
-                            "[verify_answer] 429 on attempt %d/%d, waiting %.1fs",
-                            attempt + 1, max_retries, wait,
-                        )
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(wait)
-                        continue
-                    if resp.status in (450, 403) or (resp.status >= 400 and ("sensitive information" in text.lower() or "ModelArts.81011" in text or "违规信息" in text)):
-                        # Content policy violation — retry with a bypass key once.
-                        bypass_keys_str = os.environ.get("OPENAI_API_KEY_BYPASS_POOL", "")
-                        bypass_keys = [k.strip() for k in bypass_keys_str.split(",") if k.strip() and k.strip() != api_key]
-                        if bypass_keys:
-                            import random
-                            bypass_key = random.choice(bypass_keys)
-                            logger.warning(
-                                "[verify_answer] content policy error (%d), retrying with bypass key ...%s",
-                                resp.status, bypass_key[-6:],
-                            )
-                            try:
-                                bypass_headers = {**headers, "Authorization": f"Bearer {bypass_key}"}
-                                async with aiohttp.ClientSession(timeout=client_timeout) as _s:
-                                    async with _s.post(url, headers=bypass_headers, json=payload) as _r:
-                                        _text = await _r.text()
-                                        if _r.status == 200:
-                                            return json.loads(_text)["choices"][0]["message"]["content"]
-                                        logger.warning("[verify_answer] bypass key also failed (%d)", _r.status)
-                            except Exception as _be:
-                                logger.warning("[verify_answer] bypass key exception: %s", _be)
-                        else:
-                            logger.warning("[verify_answer] content policy error, no bypass key configured")
-                        last_exc = RuntimeError(f"content policy error {resp.status} (key={api_key[:8]}...)")
-                        continue
-                    if resp.status >= 400:
-                        raise RuntimeError(f"Judge API error ({resp.status}): {text[:500]}")
-                    obj = json.loads(text)
-                    return obj["choices"][0]["message"]["content"]
+            raw = await judge_agent.async_single_turn(
+                user_prompt,
+                system_prompt,
+                0.0,
+                max_tokens,
+                True,
+            )
+
+            # json_mode=True should already return a parsed dict. Keep a string
+            # fallback for robustness in case some backend returns raw text.
+            if isinstance(raw, dict):
+                if raw:
+                    return raw
+                last_exc = RuntimeError("Judge agent returned empty JSON object")
+            elif isinstance(raw, str):
+                parsed = _extract_json_from_response(raw)
+                if parsed is not None:
+                    return parsed
+                last_exc = RuntimeError(f"Judge agent returned unparseable JSON: {raw[:300]}")
+            else:
+                last_exc = RuntimeError(f"Judge agent returned unexpected type: {type(raw).__name__}")
+
+            if attempt < max_retries - 1:
+                wait = min(timeout_s, 2 * (attempt + 1))
+                logger.warning(
+                    "[verify_answer] judge agent parse failure on attempt %d/%d, waiting %.1fs",
+                    attempt + 1, max_retries, wait,
+                )
+                await asyncio.sleep(wait)
         except asyncio.TimeoutError as e:
             last_exc = e
             wait = 2 * (attempt + 1)
@@ -631,9 +633,9 @@ async def _call_judge_api_with_retry(
             )
             if attempt < max_retries - 1:
                 await asyncio.sleep(wait)
-        except aiohttp.ClientError as e:
+        except Exception as e:
             last_exc = e
-            logger.warning("[verify_answer] Client error on attempt %d/%d: %s", attempt + 1, max_retries, e)
+            logger.warning("[verify_answer] Judge agent error on attempt %d/%d: %s", attempt + 1, max_retries, e)
             if attempt < max_retries - 1:
                 await asyncio.sleep(2 * (attempt + 1))
 

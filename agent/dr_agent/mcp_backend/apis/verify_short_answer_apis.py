@@ -1,243 +1,176 @@
 """
 verify_short_answer_apis.py
 
-Factual verifier + reward scorer for short-answer QA tasks.
+Short-answer verify_answer backend aligned with verify_longform_answer_apis:
 
-输出格式与 _verify_answer_native_short（mcp_tools.py）完全对齐，
-使 _lff_parse_r0_from_va_output（grpo_lff.py）能正确提取 r0：
+- policy-visible channel: feedback_text only
+- hidden training channel: reward_info with r0 and rl_exact_answer_reward
 
-    Answer reward: X.XXXX   ← LLM judge 正确性分数 [0,1]
-    Format reward: X.XXXX   ← 答案格式 + citation + 搜索调用格式 [0,1]
-    Search score:  X.XXXX   ← 上下文搜索轮次奖励 [0,1]
-    Rubric reward: X.XXXX   ← r0 综合分 (0.8*ans + 0.1*fmt + 0.1*srch)
-
-    ### Feedback (teacher context — do not copy into final answer):
-    <issues or positive feedback>
-
-Environment variables:
-  VERIFY_SHORT_ANSWER_MODEL        - judge model (default: RUBRIC_JUDGE_MODEL or gpt-4.1)
-  VERIFY_SHORT_ANSWER_API_BASE     - API base URL
-  VERIFY_SHORT_ANSWER_MAX_TOKENS   - max response tokens (default: 1024)
-  VERIFY_SHORT_ANSWER_TIMEOUT      - per-attempt timeout in seconds (default: 60)
-  VERIFY_SHORT_ANSWER_MAX_SP_CHARS - max chars of solution_path sent to judge (default: 12000)
+Chosen design for this file:
+- The judge model privately sees question / solution_path / predicted_answer /
+  acceptable_answers / supporting_facts.
+- The judge returns a binary score plus a short self-reflective critique.
+- The visible output keeps only textual feedback; reward_info remains hidden and
+  parseable for training.
 """
 
+import asyncio
 import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from open_instruct.ground_truth_utils import f1_score, normalize_answer
 
 from .verify_answer_apis import (
-    _call_judge_api_with_retry,
     _extract_json_from_response,
-    _get_rubric_judge_pool,
+    _get_rubric_judge_agent,
     _RUBRIC_STORE,
 )
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """\
-You are a factual verifier for a search-and-reasoning agent.
-Audit the predicted answer against the evidence in the solution path.
-Never state or imply the correct answer. Express every issue as a factual or
-evidentiary problem, not as "the answer is wrong".
+# Critique-writing prompt: produces ONLY the visible self-reflection text.
+# Scoring is handled separately by _grade_answer (strategy-configurable) — this
+# agent does not grade, so its output contains no score field.
+_SHORT_JUDGE_SYSTEM_PROMPT = """\
+You are a self-verifier for short-answer QA problems.
 
-# Solution path format
+You will be told whether the current answer is correct:
+- If CORRECT: confirm that the retrieved evidence in the solution path supports the current answer. Point to the specific retrieved content (facts, snippets, documents) that backs the answer, in first person, e.g. "The search results confirm that ... so my answer is well supported."
+- If INCORRECT: the current answer has been found wrong, so never confirm or praise it. Write a first-person reflection that pins down the concrete failure and the concrete next step, in this order:
+  1. Re-read the question and identify which facet it actually asks about, then name the exact claim, entity, date, number, or judgment in the solution that fails. Common failures: answering a different facet, stopping one hop short, or picking the wrong entity among several.
+  2. Re-examine the solution path and the supporting facts for evidence that contradicts the answer or already fills the missing piece, and point to it, e.g. "one of the snippets I retrieved already mentions ... which I overlooked" or "the supporting facts point to a different entity than the one I chose".
+  3. End with ONE concrete next action in the present tense, e.g. "I need to search for the exact X of Y" or "I should compare the two entities on Z". Never end with a generic vow like "I should verify more carefully" or "I should double-check my sources" without naming what to check.
+  For yes/no or either-or questions, say explicitly which entity or which side of the judgment is in doubt rather than discussing definitions in general.
+- If UNCERTAIN (no reference was available for the check): judge the answer purely from your own expertise, using only the question, the solution path, and the predicted answer. Point out the most likely defect and give a concrete improvement direction, checking: whether the answer addresses the exact facet the question asks; whether each claim in the answer is actually backed by the retrieved evidence in the solution path (flag unsupported or only partially supported claims); whether the reasoning steps are internally consistent; and whether a hop or entity in the question is left unresolved. Do NOT state that the answer is confirmed or well supported when you have no reference to check it against.
 
-The <solution_path> is the agent's tool-interaction trace: alternating
-<call_tool> blocks (what the agent searched/browsed) and <tool_output> blocks
-(what the tools returned).
-Example trace:
-<call_tool name="google_search">who sees the ghost of King Hamlet first</call_tool>
-<tool_output><snippet id="s1">
-Title: Hamlet Act 1 Scene 1
-Snippet: The ghost appears silently and is seen by Marcellus, Bernardo, and Horatio.
-</snippet></tool_output>
-<call_tool name="browse_webpage">https://example.com/hamlet</call_tool>
-<tool_output><webpage id="w1">
-Title: Hamlet Summary
-Snippet: Horatio is the first to confirm the ghost and later tells Hamlet.
-</webpage></tool_output>
+If <acceptable_answers> or <supporting_facts> is marked "(not provided)", you have no reference information for that part — rely on your expertise over the question, the solution path, and the predicted answer as described for the UNCERTAIN case, and do not treat the missing section as an error to mention.
 
-Each snippet/webpage block has an id (e.g. s1, w1). The predicted answer may
-reference these via <cite id="s1">. Trace every factual claim in the answer back
-to a specific snippet; if no snippet supports it, it is unsupported.
+In all cases:
+- Do NOT reveal or directly state the correct answer in any part of your response.
+- Keep it actionable, compact, and natural.
 
-# Check for these four problems
+Hard constraints:
+- Treat the inputs as strictly private hidden checks. Do NOT mention or imply the existence of any previous answer, ground truth, or evaluation schema.
+- Do NOT quote, closely paraphrase, or reproduce any hidden criterion description.
+- Do NOT output bullet points.
+- Do NOT provide chain-of-thought; only provide the final concise reflection.
+- Prefer general wording like "I should check", "I may be overstating", "I need stronger evidence", "the retrieved evidence supports", rather than specialized evaluation language.
+- Keep it to 2-4 sentences and under 120 words.
 
-1. Unsupported claim — a factual assertion in the answer that cannot be traced
-   to any retrieved snippet in <tool_output> blocks of the solution path.
 
-2. Citation mismatch — a <cite id="..."> tag where the cited snippet does not
-   actually support, or is irrelevant to, the cited claim.
-
-3. Search hallucination — the agent assumed a fact about an entity (type, role,
-   nationality, affiliation) without a retrieved snippet confirming it, or
-   resolved an ambiguous name to a specific referent without retrieval evidence.
-
-4. Question misinterpretation — the agent answered at the wrong granularity,
-   treated a proper noun as a common phrase, or addressed the wrong sub-question.
-
-# Ground truth
-
-Use it as a private oracle to identify which
-claims likely need scrutiny — do not echo it in your output.
-<ground_truth> may list multiple acceptable alternatives (any one is correct):
-when multiple are given, the predicted answer is correct if it matches ANY of them.
-
-# Correctness score
-
-  1.0 — the answer is fully supported by retrieved evidence and matches the ground truth (if provided)
-  0.0 — the answer is incorrect or unsupported
-
-# Output schema
-
+Return valid raw JSON only with the following field:
 {
-  "score": 1.0 | 0.0,
-  "issues": ["<factual or evidentiary problem>", ...],
-  "feedback": "<brief evidence-quality summary when issues is empty; null otherwise>"
+  "critique": "an actionable first-person reflection of the solution, without revealing the answer"
 }
-
-Field rules:
-- score: float, required
-- issues: list of strings, each describing one specific problem; empty list if none found
-- feedback: non-empty string when issues is empty; null otherwise
-Output raw JSON only — no markdown fences, no prose outside the object.
 """
 
-_USER_TEMPLATE = """\
-<problem>
-{problem}
-</problem>
+
+_SHORT_JUDGE_USER_TEMPLATE = """\
+<question>
+{question}
+</question>
+
+<solution_path>
+{solution_path}
+</solution_path>
 
 <predicted_answer>
 {predicted_answer}
 </predicted_answer>
 
-<ground_truth>
+<acceptable_answers>
 {ground_truth}
-</ground_truth>
+</acceptable_answers>
 
-<solution_path>
-{solution_path}
-</solution_path>"""
+<supporting_facts>
+{supporting_facts}
+</supporting_facts>
 
-_FAILURE_RESPONSE: str = (
-    "Answer reward: 0.0000\n"
-    "Format reward: 0.0000\n"
-    "Search score:  0.0000\n"
-    "Rubric reward: 0.0000\n\n"
-    "### Feedback (teacher context — do not copy into final answer):\n"
-    "Verification service temporarily unavailable.\n"
+<verdict>
+{verdict_line}
+</verdict>
+"""
+
+# Verdict lines rendered into <verdict>. UNCERTAIN is used when no ground truth
+# was available to grade against — the judge must then assess from expertise
+# instead of being (mis)told the answer is wrong.
+_VERDICT_LINES = {
+    "CORRECT": "The current answer has been checked and it is CORRECT.",
+    "INCORRECT": "The current answer has been checked and it is INCORRECT.",
+    "UNCERTAIN": (
+        "No reference answer was available for this check, so the correctness of "
+        "the current answer is unknown. Assess it yourself from the question, the "
+        "solution path, and the predicted answer."
+    ),
+}
+
+
+_VISIBLE_CRITIQUE_META_MARKERS = (
+    "acceptable answer",
+    "correct answer",
+    "reference answer",
+    "ground truth",
+    "predicted answer",
 )
 
+# Grader prompt aligned with the trainer's LLMJudgeVerifier (ground_truth_utils
+# GRADER_TEMPLATE) so r0 (draft, graded here) and r1 (final answer, graded in
+# training) are scored by the SAME prompt semantics — r1 - r0 then measures the
+# true effect of feedback instead of inter-judge disagreement.
+# The extraction step is kept even though only the verdict is parsed: it is what
+# lets the grader reduce a verbose response ("Yes, both X and Y are documentaries...")
+# to the comparable answer ("yes") — without it the grader compares the full
+# sentence against a short GT and systematically answers 'no'.
+_GRADER_SYSTEM_PROMPT = "You are a precise grading assistant. Output only the requested lines."
+_GRADER_USER_TEMPLATE = """\
+Judge whether the following [response] to [question] is correct or not based on the precise and unambiguous [correct_answer] below.
+
+[question]: {question}
+
+[response]: {response}
+
+[correct_answer]: {correct_answer}
+
+Your judgement must be in the format and criteria specified below:
+
+extracted_final_answer: The final exact answer extracted from the [response]. Put the extracted answer as 'None' if there is no exact, final answer to extract from the response.
+
+correct: Answer 'yes' if extracted_final_answer matches the [correct_answer] given above, or is within a small margin of error for numerical problems. Answer 'no' otherwise, i.e. if there if there is any inconsistency, ambiguity, non-equivalency, or if the extracted answer is incorrect.
+
+Output ONLY those two lines, nothing else."""
+
+
 # ---------------------------------------------------------------------------
-# Config helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _get_model() -> str:
-    return (
-        os.environ.get("VERIFY_SHORT_ANSWER_MODEL")
-        or os.environ.get("RUBRIC_JUDGE_MODEL", "gpt-4.1")
-    )
-
-def _get_api_base() -> str:
-    return (
-        os.environ.get("VERIFY_SHORT_ANSWER_API_BASE")
-        or os.environ.get("RUBRIC_JUDGE_API_BASE")
-        or os.environ.get("OPENAI_API_BASE", "http://127.0.0.1:8000/v1")
-    )
-
-def _get_max_tokens() -> int:
-    return int(os.environ.get("VERIFY_SHORT_ANSWER_MAX_TOKENS", "1024"))
-
-def _get_timeout() -> float:
-    return float(os.environ.get("VERIFY_SHORT_ANSWER_TIMEOUT", "60"))
-
-def _get_max_sp_chars() -> int:
-    return int(os.environ.get("VERIFY_SHORT_ANSWER_MAX_SP_CHARS", "12000"))
-
-# ---------------------------------------------------------------------------
-# Reward scoring helpers（与 _verify_answer_native_short 使用相同的权重和逻辑）
-# ---------------------------------------------------------------------------
-
-# r0 = 0.8 * answer_score + 0.1 * format_reward + 0.1 * search_turns_reward
-_W_ANSWER  = 0.8
-_W_FORMAT  = 0.1
-_W_SEARCH  = 0.1
-
-# format_reward 内部权重（与 open_instruct/search_rewards/utils/format_utils.py 对齐）
-_W_FMT_ANSWER   = 0.5  # <answer>...</answer> 存在
-_W_FMT_CITATION = 0.3  # <cite ...>...</cite> 存在
-_W_FMT_QUERY    = 0.2  # 有搜索工具调用记录
-
-# search_turns_reward 上界（3 次及以上搜索 → 满分）
-_SEARCH_UPPER_BOUND = 3
-
-# <answer>...</answer> 内容提取正则（用于清洗 predicted_answer）
-_ANSWER_EXTRACT_RE = re.compile(
-    r'<answer>(.*?)</answer>',
-    re.DOTALL | re.IGNORECASE,
-)
-# \boxed{...} 提取正则（模型输出数学格式时）
+_ANSWER_EXTRACT_RE = re.compile(r'<answer>(.*?)</answer>', re.DOTALL | re.IGNORECASE)
 _BOXED_RE = re.compile(r'\\boxed\{(.*?)\}', re.DOTALL)
-
-# 检索块正则（匹配 <snippet>/<snippets>/<webpage> 块，用于 format/search reward）
-_SNIPPET_BLOCK_RE = re.compile(
-    r'<(?:snippets?|webpage)\b[^>]*>',
+_SEARCH_CALL_RE = re.compile(
+    r'<call_tool\s+[^>]*name=["\']?(?:google_search|snippet_search|browse_webpage)["\']?',
     re.IGNORECASE,
 )
-# <answer>...</answer> 正则（排除 verify_answer 调用内部的 <answer> 标签）
-_ANSWER_TAG_RE = re.compile(
-    r'<answer>(.*?)</answer>',
-    re.DOTALL | re.IGNORECASE,
-)
-# <cite ...>...</cite> 正则
-_CITE_TAG_RE = re.compile(
-    r'<cite\b[^>]*>',
-    re.IGNORECASE,
-)
+_CITE_TAG_RE = re.compile(r'<cite\b[^>]*>', re.IGNORECASE)
 
 
 def _extract_clean_answer(predicted_answer: str) -> str:
-    """清洗 predicted_answer，消除格式噪声，同时保留完整答案语义。
-
-    策略：substitute（替换格式标记）而非 extract（只取部分内容）：
-    1. 若含 <answer>...</answer> 标签，取标签内全部内容
-    2. 将所有 \\boxed{content} 替换为 content（保留上下文，只去掉 LaTeX 包装）
-    3. 去除首尾空白
-
-    示例（substitute 而非 extract）：
-      "<answer>\\n\\boxed{heterochromia}\\n</answer>"
-        → "heterochromia"                              ✓ 纯短答案，正常提取
-
-      "<answer>Based on Martini's melody, arranged by \\boxed{Peretti, Creatore, Weiss}.</answer>"
-        → "Based on Martini's melody, arranged by Peretti, Creatore, Weiss."
-          ↑ 保留了 Martini，只去掉 \\boxed{}；judge 能看到完整信息       ✓
-
-      "\\boxed{42}"
-        → "42"                                         ✓
-    """
     text = predicted_answer or ""
-    # Step 1: 取 <answer> 标签内容（若存在）
     m = _ANSWER_EXTRACT_RE.search(text)
     if m:
         text = m.group(1)
-    # Step 2: 替换 \boxed{content} → content（保留全文语义）
     text = _BOXED_RE.sub(lambda mo: mo.group(1), text)
     return text.strip()
 
 
-def _normalize_gt_to_list(ground_truth) -> list:
-    """将 ground_truth（list / str / None）归一化为去重的答案列表。
-
-    str 输入会尝试 JSON 解析（如 '["a","b"]' → ["a","b"]），失败则按单值处理。
-    """
+def _normalize_gt_to_list(ground_truth) -> List[str]:
     if ground_truth is None:
         return []
     if isinstance(ground_truth, list):
@@ -252,7 +185,6 @@ def _normalize_gt_to_list(ground_truth) -> list:
         s = ground_truth.strip()
         if not s:
             return []
-        # 尝试 JSON 解析（train.jsonl 的 ground_truth 常是 JSON 字符串列表）
         try:
             parsed = json.loads(s)
         except json.JSONDecodeError:
@@ -261,139 +193,352 @@ def _normalize_gt_to_list(ground_truth) -> list:
     return [str(ground_truth).strip()]
 
 
-def _format_ground_truth(gt_list: list) -> str:
-    """将答案列表格式化为 judge prompt 可读的 <ground_truth> 内容。
-
-    单答案 → 原样返回
-    多答案 → 列出所有可接受候选（judge 任意命中其一即判正确）
-    """
-    if not gt_list:
+def _format_list_for_prompt(items: List[str]) -> str:
+    if not items:
         return ""
-    if len(gt_list) == 1:
-        return gt_list[0]
-    # 多候选：明确告知 judge 这些是可互换的等价答案
-    lines = ["Any of the following is a correct answer:"]
-    lines += [f"- {a}" for a in gt_list]
-    return "\n".join(lines)
+    if len(items) == 1:
+        return items[0]
+    return "\n".join(f"- {x}" for x in items)
 
 
 def _compute_format_reward(solution_path: str, predicted_answer: str) -> float:
-    """与 open_instruct compute_format_reward 对齐的简化版本。
-
-    answer_format_reward  : predicted_answer 本身包含 <answer> 标签
-    citation_format_reward: solution_path 中有 <cite> 引用
-    query_format_reward   : solution_path 中有搜索工具调用
-
-    format_reward = 0.5*answer + 0.3*citation + 0.2*query
-    """
-    # answer_format_reward: predicted_answer 包含 <answer> 标签
-    answer_fmt = 1.0 if _ANSWER_TAG_RE.search(predicted_answer) else 0.0
-
-    # citation_format_reward: solution_path 中有 <cite> 引用
-    cite_fmt = 1.0 if _CITE_TAG_RE.search(solution_path) else 0.0
-
-    # query_format_reward: solution_path 中有搜索工具调用
-    query_fmt = 1.0 if _SEARCH_CALL_RE.search(solution_path) else 0.0
-
-    return _W_FMT_ANSWER * answer_fmt + _W_FMT_CITATION * cite_fmt + _W_FMT_QUERY * query_fmt
+    answer_fmt = 1.0 if _ANSWER_EXTRACT_RE.search(predicted_answer or "") else 0.0
+    cite_fmt = 1.0 if _CITE_TAG_RE.search(solution_path or "") else 0.0
+    query_fmt = 1.0 if _SEARCH_CALL_RE.search(solution_path or "") else 0.0
+    return 0.5 * answer_fmt + 0.3 * cite_fmt + 0.2 * query_fmt
 
 
 def _compute_search_turns_reward(solution_path: str) -> float:
-    """与 open_instruct score_num_in_context_search_turns 对齐的简化版本。
+    n = len(_SEARCH_CALL_RE.findall(solution_path or ""))
+    return min(1.0, n / 3.0)
 
-    统计 solution_path 中的搜索工具调用次数：
-      0 次 → 0.0,  1 次 → 1/3,  2 次 → 2/3,  ≥3 次 → 1.0
+
+def _compute_rl_exact_answer_reward(clean_answer: str, gt_list: List[str]) -> float:
+    """F1-based answer reward, aligned with the trainer's r1 verifier
+    (rl_rag_exact_answer, --verifier_strategy f1): max F1 over GT candidates,
+    with the same 0.1 floor for well-formatted but wrong answers.
+
+    A hard-EM-only comparison penalizes verbose drafts that contain the correct
+    answer (e.g. draft "Deepdale Golf Club is located in Nassau County." vs GT
+    "Nassau County"): r0 = 0 while the trainer's F1 gives r1 > 0, systematically
+    suppressing A0 and desynchronizing the r0-baseline from r1.
     """
-    n = len(_SEARCH_CALL_RE.findall(solution_path))
-    return min(1.0, n / _SEARCH_UPPER_BOUND)
+    if not clean_answer or not gt_list:
+        return 0.0
+    score = max(f1_score(clean_answer, str(gt))["f1"] for gt in gt_list)
+    if score == 0:
+        # Format-correct floor, mirrors RLRAGExactAnswerVerifier's
+        # "if f1 == 0 but format is correct, return 0.1".
+        return 0.1
+    return float(score)
 
 
-def _format_output(
-    answer_score: float,
-    format_reward: float,
-    search_turns_reward: float,
-    issues: List[str],
-    feedback: Optional[str],
-    judge_score_available: bool = True,
-) -> str:
-    """将各维度分数格式化为与 _verify_answer_native_short 完全一致的输出字符串。
+def _sanitize_supporting_facts(metadata: Optional[Dict[str, Any]]) -> List[str]:
+    if not isinstance(metadata, dict):
+        return []
+    sf = metadata.get("supporting_facts")
+    if not isinstance(sf, dict):
+        return []
 
-    _lff_parse_r0_from_va_output 依赖以下行格式：
-        Answer reward: X.XXXX
-        Format reward: X.XXXX
-        Search score:  X.XXXX
-        Rubric reward: X.XXXX
+    titles = sf.get("title") if isinstance(sf.get("title"), list) else []
+    seen = set()
+    ordered_titles: List[str] = []
+    for t in titles:
+        s = str(t).strip()
+        if s and s not in seen:
+            seen.add(s)
+            ordered_titles.append(s)
+    return ordered_titles
+
+
+def _validate_short_judge_result(obj: Any) -> Optional[str]:
+    """Validate the critique agent's JSON output. Returns the critique text or None.
+
+    The critique agent no longer grades (scoring lives in _grade_answer), so
+    only the 'critique' field is required. A stale 'score' field — e.g. from a
+    judge still following the old prompt — is ignored.
     """
-    r0 = max(0.0, min(1.0,
-        _W_ANSWER * answer_score
-        + _W_FORMAT * format_reward
-        + _W_SEARCH * search_turns_reward
-    ))
-
-    lines = [
-        f"Answer reward: {answer_score:.4f}",
-        f"Format reward: {format_reward:.4f}",
-        f"Search score:  {search_turns_reward:.4f}",
-        f"Rubric reward: {r0:.4f}",
-        "",
-    ]
-
-    lines.append("### Feedback (teacher context — do not copy into final answer):")
-    if issues:
-        lines.append("Issues identified in your solution path:")
-        for iss in issues:
-            lines.append(f"  - {iss}")
-    elif feedback and feedback.strip():
-        lines.append(feedback.strip())
-    else:
-        if answer_score >= 1.0:
-            lines.append("The extracted answer matches the correct answer.")
-        else:
-            lines.append("Incorrect: could not verify the answer against retrieved evidence.")
-    lines.append("")
-
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Judge response parsing
-# ---------------------------------------------------------------------------
-
-def _validate_and_normalize(obj: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(obj, dict):
         return None
 
-    # score field
-    raw_score = obj.get("score")
-    try:
-        score = float(raw_score) if raw_score is not None else None
-    except (TypeError, ValueError):
-        score = None
+    critique = str(obj.get("critique", "") or "").strip()
+    critique = re.sub(r"\s+", " ", critique)
+    if not critique:
+        return None
+    if len(critique) > 1200:
+        critique = critique[:1200].strip()
 
-    issues_raw = obj.get("issues", [])
-    if not isinstance(issues_raw, list):
+    return critique
+
+
+def _normalized_contains(haystack: str, needle: str) -> bool:
+    hay = normalize_answer(haystack or "")
+    ned = normalize_answer(needle or "")
+    if not hay or not ned:
+        return False
+    return ned in hay
+
+
+def _gt_ngram_leak(text_norm: str, gt: str, draft_norm: str) -> bool:
+    """Detect partial leaks of a multi-word ground truth.
+
+    The full-GT containment check misses critiques that leak only the
+    distinctive part of a long GT (observed in HotpotQA: GT "Greenwich Village,
+    New York City" leaked as "Greenwich Village"). Flag any run of 3+
+    consecutive normalized GT tokens appearing verbatim in the critique but NOT
+    already present in the draft — repeating what the draft itself said leaks
+    nothing new, so near-correct drafts whose critiques re-quote their entities
+    are not rejected. 2-gram overlaps (e.g. "New York") are tolerated to avoid
+    false rejections.
+    """
+    gt_tokens = normalize_answer(str(gt)).split()
+    if len(gt_tokens) < 4:
+        return False  # short GTs are covered by the full-containment check
+    for n in range(3, len(gt_tokens) + 1):
+        for i in range(len(gt_tokens) - n + 1):
+            gram = " ".join(gt_tokens[i:i + n])
+            if gram in text_norm and gram not in draft_norm:
+                return True
+    return False
+
+
+def _sanitize_visible_critique(
+    critique: str,
+    *,
+    clean_answer: str,
+    gt_list: List[str],
+) -> Optional[str]:
+    """Return the critique when it is genuine, safe judge output; None otherwise.
+
+    Rejections (not self-reflective, meta-answer markers, echoed predicted
+    answer, leaked acceptable answer) mean the visible text is NOT usable
+    judge feedback — the caller marks the whole verification as failed
+    (feedback_text=None) instead of substituting a canned string.
+    """
+    text = re.sub(r"\s+", " ", str(critique or "").strip())
+    if not text:
         return None
 
-    normalised_issues: List[str] = []
-    for item in issues_raw:
-        if isinstance(item, str):
-            s = item.strip()
-            if s:
-                normalised_issues.append(s)
-        elif isinstance(item, dict):
-            s = str(item.get("critique", "") or item.get("action", "")).strip()
-            if s:
-                normalised_issues.append(s)
+    lower = text.lower()
+    if not re.search(r"\b(i|i'm|i’ll|i should|i need|i can|i must|my)\b", lower):
+        logger.warning("[verify_short_answer] critique rejected: not self-reflective")
+        return None
 
-    feedback = obj.get("feedback")
-    if feedback is not None:
-        feedback = str(feedback).strip() or None
+    if any(marker in lower for marker in _VISIBLE_CRITIQUE_META_MARKERS):
+        logger.warning("[verify_short_answer] critique rejected: meta-answer marker detected")
+        return None
 
+    clean_answer_norm = normalize_answer(clean_answer or "")
+    if len(clean_answer_norm) >= 8 and _normalized_contains(text, clean_answer):
+        logger.warning("[verify_short_answer] critique rejected: echoed predicted answer")
+        return None
+
+    for gt in gt_list:
+        gt_norm = normalize_answer(str(gt))
+        if len(gt_norm) >= 4 and _normalized_contains(text, str(gt)):
+            logger.warning("[verify_short_answer] critique rejected: leaked acceptable answer")
+            return None
+
+    text_norm = normalize_answer(text)
+    draft_norm = normalize_answer(clean_answer or "")
+    for gt in gt_list:
+        if _gt_ngram_leak(text_norm, str(gt), draft_norm):
+            logger.warning("[verify_short_answer] critique rejected: leaked part of acceptable answer")
+            return None
+
+    return text
+
+
+def _build_reward_info(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "score":    score,
-        "issues":   normalised_issues,
-        "feedback": feedback,
+        "schema_version": "verify_short_answer_v2",
+        "verifier": "verify_short_answer",
+        "r0": float(payload.get("r0", 0.0) or 0.0),
+        "rl_exact_answer_reward": float(payload.get("rl_exact_answer_reward", 0.0) or 0.0),
+        "format_reward": float(payload.get("format_reward", 0.0) or 0.0),
+        "num_search_turns_reward": float(payload.get("num_search_turns_reward", 0.0) or 0.0),
+        "judge_score": float(payload.get("judge_score", 0.0) or 0.0),
+        "grade_strategy": str(payload.get("grade_strategy", "") or ""),
+        "used_ground_truth_candidates": int(payload.get("used_ground_truth_candidates", 0) or 0),
+        "reflection_summary": str(payload.get("reflection_summary", "") or ""),
+        # True only when the visible feedback is genuine judge-model output.
+        # The RL trainer drops trajectories whose verify_answer feedback is
+        # not valid (feedback_text=None / feedback_valid=False).
+        "feedback_valid": bool(payload.get("feedback_valid")) and not payload.get("error"),
+        "error": payload.get("error"),
     }
+
+
+def _format_output(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """feedback_text is the genuine judge reflection, or None on failure.
+
+    None (never a canned fallback string) lets downstream layers distinguish
+    real judge feedback from failures by a simple emptiness check.
+    """
+    feedback_valid = bool(payload.get("feedback_valid")) and not payload.get("error")
+    feedback_text = str(payload.get("reflection_summary", "") or "").strip() if feedback_valid else ""
+    return {
+        "feedback_text": feedback_text or None,
+        "reward_info": _build_reward_info(payload),
+    }
+
+
+def _get_grading_strategy() -> str:
+    """r0 scoring strategy: 'judge' | 'f1' | 'em'.
+
+    Defaults to 'judge' (aligned with the trainer's --verifier_strategy judge):
+    the draft is graded with the same GRADER_TEMPLATE semantics as the final
+    answer, so r1 - r0 isolates the effect of feedback rather than measuring
+    disagreement between two different judges.
+    """
+    return os.environ.get("VERIFY_SHORT_ANSWER_STRATEGY", "judge").strip().lower()
+
+
+async def _grade_answer(
+    *,
+    problem: str,
+    clean_answer: str,
+    gt_list: List[str],
+) -> Tuple[float, bool]:
+    """Grade the draft answer. Returns (score, grade_ok).
+
+    Strategies (VERIFY_SHORT_ANSWER_STRATEGY):
+      - judge: LLM grader with the trainer-aligned GRADER_TEMPLATE; binary
+               1.0/0.0, 0.1 floor for empty-but-well-formatted output.
+      - f1:    token-F1 vs GT candidates (trainer's f1 strategy), 0.1 floor.
+      - em:    normalized exact match (trainer's em strategy), no partial credit.
+    """
+    if not clean_answer or not gt_list:
+        return 0.0, False
+
+    strategy = _get_grading_strategy()
+    if strategy == "f1":
+        return _compute_rl_exact_answer_reward(clean_answer, gt_list), True
+    if strategy == "em":
+        return float(
+            max(normalize_answer(clean_answer) == normalize_answer(str(gt)) for gt in gt_list)
+        ), True
+
+    # judge strategy: same prompt semantics as the trainer's LLMJudgeVerifier.
+    agent = _get_rubric_judge_agent()
+    if agent is None:
+        logger.warning("[verify_short_answer] grader agent unavailable")
+        return 0.0, False
+
+    # Grade against each GT candidate; take the max (mirrors the trainer's
+    # max-over-labels behavior).
+    async def _grade_one(gt: str) -> float:
+        user_prompt = _GRADER_USER_TEMPLATE.format(
+            question=problem.strip(),
+            response=clean_answer,
+            correct_answer=str(gt),
+        )
+        # extraction + verdict; 128 is ample headroom and keeps the grader cheap.
+        max_tokens = int(os.environ.get("VERIFY_SHORT_ANSWER_GRADER_MAX_TOKENS", "128"))
+        try:
+            raw = await agent.async_single_turn(
+                user_prompt,
+                _GRADER_SYSTEM_PROMPT,
+                None,
+                max_tokens,
+                False,
+            )
+        except Exception as e:
+            logger.warning("[verify_short_answer] grader call failed: %s", e)
+            return -1.0  # sentinel: call failed (distinguishable from score 0)
+        text = raw if isinstance(raw, str) else str(raw or "")
+        # Negative look-behind so "incorrect: yes" inside reasoning does not
+        # match (only the standalone "correct:" verdict line counts).
+        m = re.search(r"(?<![a-z])correct:\s*(yes|no)", text, re.IGNORECASE)
+        if m is None:
+            logger.warning("[verify_short_answer] grader output unparseable: %r", text[:120])
+            return -1.0
+        return 1.0 if m.group(1).lower() == "yes" else 0.0
+
+    scores = await asyncio.gather(*(_grade_one(gt) for gt in gt_list))
+    valid = [s for s in scores if s >= 0]
+    if not valid:
+        return 0.0, False
+    # A graded 'no' on all candidates with no call failure → 0.0 (still valid).
+    return max(valid), True
+
+
+async def _write_critique(
+    *,
+    problem: str,
+    clean_answer: str,
+    gt_list: List[str],
+    solution_path: str,
+    supporting_facts: List[str],
+    grade_score: Optional[float] = None,
+) -> Tuple[Optional[str], bool]:
+    """Write the self-reflective critique shown to the policy model.
+
+    Returns (critique, critique_ok). critique_ok is True only when the judge
+    agent ran, its output parsed, and the critique passed sanitization.
+
+    When grade_score is provided and >= 1.0, the critique agent is told the
+    answer is CORRECT and asked to confirm that the retrieved evidence
+    supports it (instead of hunting for issues).
+
+    When gt_list is empty (no acceptable answers available), the verdict is
+    UNCERTAIN and the judge is asked to diagnose defects from its own expertise
+    over question / solution_path / predicted_answer — missing hidden inputs
+    are rendered as "(not provided)" rather than blocking the critique.
+    """
+    if not clean_answer:
+        return None, False
+
+    agent = _get_rubric_judge_agent()
+    if agent is None:
+        logger.warning("[verify_short_answer] critique agent unavailable")
+        return None, False
+
+    if grade_score is not None and grade_score >= 1.0:
+        verdict = "CORRECT"
+    elif not gt_list:
+        verdict = "UNCERTAIN"
+    else:
+        verdict = "INCORRECT"
+
+    user_prompt = _SHORT_JUDGE_USER_TEMPLATE.format(
+        question=problem.strip(),
+        solution_path=solution_path.strip(),
+        predicted_answer=clean_answer,
+        ground_truth=_format_list_for_prompt(gt_list) if gt_list else "(not provided)",
+        supporting_facts=(
+            _format_list_for_prompt(supporting_facts) if supporting_facts else "(not provided)"
+        ),
+        verdict_line=_VERDICT_LINES[verdict],
+    )
+
+    max_tokens = int(os.environ.get("VERIFY_SHORT_ANSWER_MAX_TOKENS", "256"))
+    try:
+        raw = await agent.async_single_turn(
+            user_prompt,
+            _SHORT_JUDGE_SYSTEM_PROMPT,
+            None,
+            max_tokens,
+            True,
+        )
+    except Exception as e:
+        logger.warning("[verify_short_answer] critique generation failed: %s", e)
+        return None, False
+
+    obj = raw if isinstance(raw, dict) else _extract_json_from_response(raw)
+    raw_critique = _validate_short_judge_result(obj)
+    if raw_critique is None:
+        logger.warning("[verify_short_answer] critique output unparseable")
+        return None, False
+
+    critique = _sanitize_visible_critique(
+        raw_critique,
+        clean_answer=clean_answer,
+        gt_list=gt_list,
+    )
+    if not critique:
+        return None, False
+    return critique, True
 
 
 # ---------------------------------------------------------------------------
@@ -405,154 +550,90 @@ async def verify_short_answer_handler(
     predicted_answer: str,
     ground_truth="",
     solution_path: str = "",
-) -> str:
-    """
-    短答案验证 + 奖励评分。返回格式化字符串，与 _verify_answer_native_short 对齐，
-    使 _lff_parse_r0_from_va_output 能正确提取 r0。
-
-    Parameters
-    ----------
-    problem          : 原始问题
-    predicted_answer : 模型预测答案（含 <answer>...</answer> 标签）
-    ground_truth     : 参考答案（私有 oracle，不在输出中泄露）
-    solution_path    : 完整推理轨迹（CoT + 工具调用 + 工具输出），judge 据此审计证据完整性
-
-    Raises
-    ------
-    ValueError
-        当无法提取到 ground_truth 时（参数未提供且 RubricStore 查询失败）直接抛出，
-        不使用 fallback，避免在无 GT 情况下给出误导性分数。
-
-    Returns
-    -------
-    格式化字符串，包含：
-        Answer reward: X.XXXX
-        Format reward: X.XXXX
-        Search score:  X.XXXX
-        Rubric reward: X.XXXX
-
-        ### Feedback (teacher context — do not copy into final answer):
-        <issues or positive feedback>
-    """
-    # ── 1. 清洗 predicted_answer，消除 <answer>/\boxed{} 格式噪声 ──────────
-    # 传给 judge 的是干净的答案文本（如 "heterochromia"），
-    # 避免 judge 因 LaTeX/XML 格式不一致而给出矛盾的评分。
-    # format_reward 仍用原始 predicted_answer 计算（检测 <answer> 标签是否存在）。
+) -> Dict[str, Any]:
+    """Short-answer verify_answer with visible reflection + hidden exact-answer reward."""
     clean_answer = _extract_clean_answer(predicted_answer)
-
-    # ── 2. 本地计算 format_reward 和 search_turns_reward（基于 solution_path）──
-    format_reward       = _compute_format_reward(solution_path, predicted_answer)
+    format_reward = _compute_format_reward(solution_path, predicted_answer)
     search_turns_reward = _compute_search_turns_reward(solution_path)
 
-    if not predicted_answer or not predicted_answer.strip():
-        return _format_output(
-            answer_score=0.0,
-            format_reward=format_reward,
-            search_turns_reward=search_turns_reward,
-            issues=[],
-            feedback="No predicted answer provided — nothing to verify.",
-        )
-
-    # ── 3. GT 归一化为候选列表 + 自动填充 ────────────────────────────────
-    # ground_truth 参数可能是 str（调用方传入）或来自 store 的 list[str]。
-    # 统一归一化为 list[str]，保留多答案候选，不截断。
     gt_list = _normalize_gt_to_list(ground_truth)
-
     if not gt_list and problem:
-        # 参数未提供 GT → 从 RubricStore 查询（返回 list[str] 或 None）
         store_gt = _RUBRIC_STORE.get_ground_truth(problem)
         if store_gt:
             gt_list = list(store_gt)
-            logger.info(
-                "[verify_short_answer] GT auto-filled from store: %d candidates %r",
-                len(gt_list), gt_list[:2],
-            )
 
-    # GT 缺失直接抛异常，不用 fallback —— 无 GT 时 judge 无法判定正确性，
-    # 给出分数会误导训练。由调用方决定如何处理（跳过/重试/记录）。
-    if not gt_list:
-        raise ValueError(
-            f"[verify_short_answer] cannot extract ground_truth for problem={problem[:80]!r} "
-            f"(ground_truth param empty and RubricStore lookup failed). "
-            f"Set GT_DATASET_PATH or pass ground_truth explicitly."
+    metadata = _RUBRIC_STORE.get_ground_truth_metadata(problem) if problem else None
+    supporting_facts = _sanitize_supporting_facts(metadata)
+
+    if not predicted_answer or not predicted_answer.strip():
+        return _format_output(
+            {
+                "r0": 0.0,
+                "rl_exact_answer_reward": 0.0,
+                "judge_score": 0.0,
+                "format_reward": format_reward,
+                "num_search_turns_reward": search_turns_reward,
+                "used_ground_truth_candidates": len(gt_list),
+                "reflection_summary": None,
+                "feedback_valid": False,
+                "error": "No predicted answer provided",
+            }
         )
 
-    # 格式化为 judge prompt 可读文本（单答案原样，多答案列为等价候选）
-    gt_display = _format_ground_truth(gt_list)
-    has_sp = bool(solution_path and solution_path.strip())
-    logger.info(
-        "[verify_short_answer] request: n_gt_candidates=%d has_solution_path=%s "
-        "answer_chars=%d sp_chars=%d",
-        len(gt_list), has_sp, len(predicted_answer), len(solution_path),
+    # Score first, then critique: the critique prompt branches on the verdict
+    # (CORRECT → confirm retrieved evidence supports the answer; INCORRECT →
+    # actionable first-person reflection), so it must wait for the grade.
+    grade_score, grade_ok = await _grade_answer(
+        problem=problem, clean_answer=clean_answer, gt_list=gt_list,
     )
-
-    # ── 4. LLM Judge：基于 solution_path 审计证据完整性 ───────────────────
-    max_sp_chars = _get_max_sp_chars()
-    sp_text = solution_path.strip() if has_sp else "(no solution path provided)"
-    if len(sp_text) > max_sp_chars:
-        sp_text = sp_text[:max_sp_chars] + "\n... [truncated]"
-
-    user_prompt = _USER_TEMPLATE.format(
-        problem=problem.strip(),
-        predicted_answer=clean_answer,          # 清洗后的干净答案，消除格式噪声
-        ground_truth=gt_display,
-        solution_path=sp_text,
-    )
-
-    model    = _get_model()
-    api_base = _get_api_base()
-    pool     = _get_rubric_judge_pool()
-
-    try:
-        raw = await _call_judge_api_with_retry(
-            system_prompt=_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            model=model,
-            api_base=api_base,
-            max_tokens=_get_max_tokens(),
-            timeout_s=_get_timeout(),
-            pool=pool,
-        )
-    except Exception as exc:
-        logger.warning("[verify_short_answer] API call failed: %s", exc)
-        return _FAILURE_RESPONSE
-
-    if os.environ.get("VERIFY_SHORT_ANSWER_LOG_IO", "").lower() in ("1", "true", "yes"):
-        logger.info(
-            "[verify_short_answer][io]\n--- user_prompt ---\n%s\n--- raw ---\n%s",
-            user_prompt,
-            raw,
-        )
-
-    obj = _extract_json_from_response(raw) if isinstance(raw, str) else raw
-    result = _validate_and_normalize(obj)
-
-    if result is None:
-        logger.warning(
-            "[verify_short_answer] Could not parse judge response: %s",
-            str(raw)[:300],
-        )
-        return _FAILURE_RESPONSE
-
-    # ── 4. 提取 answer_score ─────────────────────────────────────────────
-    # 优先使用 judge 返回的 score 字段 [0,1]；
-    # 降级：无 issues → 1.0，有 issues → 0.0
-    judge_score = result.get("score")
-    if judge_score is not None:
-        answer_score = max(0.0, min(1.0, float(judge_score)))
+    if grade_ok and grade_score >= 1.0:
+        # Fully correct — skip the feedback model entirely; the critique adds
+        # nothing but latency and risk of contradicting a correct answer.
+        critique = "My answer is well supported."
+        critique_ok = True
     else:
-        answer_score = 0.0 if result["issues"] else 1.0
+        critique, critique_ok = await _write_critique(
+            problem=problem,
+            clean_answer=clean_answer,
+            gt_list=gt_list,
+            solution_path=solution_path,
+            supporting_facts=supporting_facts,
+            grade_score=grade_score if grade_ok else None,
+        )
+
+    rl_exact_answer_reward = _compute_rl_exact_answer_reward(clean_answer, gt_list)
+    grade_strategy = _get_grading_strategy()
+    if grade_ok:
+        r0 = grade_score
+    else:
+        # Grading failed (agent unavailable / all grader calls errored) —
+        # fall back to F1 so r0 is still comparable across the group.
+        r0 = rl_exact_answer_reward
+        grade_strategy += "+f1_fallback"
+
+    payload = {
+        "r0": float(r0),
+        "rl_exact_answer_reward": float(rl_exact_answer_reward),
+        "judge_score": float(grade_score),
+        "format_reward": float(format_reward),
+        "num_search_turns_reward": float(search_turns_reward),
+        "used_ground_truth_candidates": len(gt_list),
+        "grade_strategy": grade_strategy,
+        # None when the critique failed / was rejected — feedback_text becomes None.
+        "reflection_summary": critique,
+        "feedback_valid": critique_ok,
+        "error": None,
+    }
 
     logger.info(
-        "[verify_short_answer] answer_score=%.4f issues=%d fmt=%.3f srch=%.3f clean_answer=%r",
-        answer_score, len(result["issues"]), format_reward, search_turns_reward,
-        clean_answer[:60],
+        "[verify_short_answer] done r0=%.4f strategy=%s exact=%.3f grade_ok=%s critique_ok=%s fmt=%.3f search=%.3f gt=%d",
+        r0,
+        grade_strategy,
+        rl_exact_answer_reward,
+        grade_ok,
+        critique_ok,
+        format_reward,
+        search_turns_reward,
+        len(gt_list),
     )
-
-    return _format_output(
-        answer_score=answer_score,
-        format_reward=format_reward,
-        search_turns_reward=search_turns_reward,
-        issues=result["issues"],
-        feedback=result["feedback"],
-    )
+    return _format_output(payload)

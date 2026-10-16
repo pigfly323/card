@@ -2,7 +2,6 @@
 
 ## Setup
 
-We assume that you have cloned the repository, and are in `dr-tulu/rl/open-instruct`.
 
 First, install new dependencies with `uv`. Note that this environment points to your local installation of `dr-agent` (modified from pip) and some new dependencies like Tevatron and Pyserini. You should be able to 1-click sync with:
 ```bash

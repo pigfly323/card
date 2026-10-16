@@ -343,7 +343,7 @@ class RubricStore:
             "RubricStore GT: index ready, total=%d queries", len(self._gt_index)
         )
         logger.info("First 3 GT entries: %s", list(self._gt_index.items())[:3])
-        logger.info("Ground-truth for question 'who got the first nobel prize in physics?': %s", self._gt_index.get("who got the first nobel prize in physics?"))
+        logger.info("Ground-truth for question 'Deepdale Golf Club is a private golf club in what county?': %s", self._gt_index.get("Deepdale Golf Club is a private golf club in what county?"))
 
 
     def get_ground_truth(self, question: Optional[str]) -> Optional[List[str]]:
